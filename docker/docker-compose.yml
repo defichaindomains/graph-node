@@ -19,8 +19,9 @@ services:
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
-      ethereum: 'mainnet:http://host.docker.internal:8545'
+      ethereum: 'testnet:http://35.195.186.78:18551'
       GRAPH_LOG: info
+      GRAPH_ALLOW_NON_DETERMINISTIC_IPFS: 1
   ipfs:
     image: ipfs/kubo:v0.14.0
     ports:
