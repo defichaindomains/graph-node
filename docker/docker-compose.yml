@@ -19,7 +19,7 @@ services:
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
-      ethereum: 'testnet:http://35.195.186.78:18551'
+      ethereum: 'testnet:https://eth.testnet.ocean.jellyfishsdk.com/'
       GRAPH_LOG: info
       GRAPH_ALLOW_NON_DETERMINISTIC_IPFS: 1
   ipfs:
