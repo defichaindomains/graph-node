@@ -2,13 +2,17 @@ use std::collections::BTreeMap;
 use std::result;
 use std::sync::Arc;
 
-use graph::components::store::{SubscriptionManager, UnitStream};
+use graph::components::graphql::GraphQLMetrics as _;
+use graph::components::store::{QueryPermit, SubscriptionManager, UnitStream};
 use graph::data::graphql::load_manager::LoadManager;
 use graph::data::graphql::{object, ObjectOrInterface};
 use graph::data::query::{CacheStatus, Trace};
 use graph::data::value::{Object, Word};
 use graph::prelude::*;
-use graph::schema::{ast as sast, ApiSchema, META_FIELD_TYPE};
+use graph::schema::{
+    ast as sast, ApiSchema, INTROSPECTION_SCHEMA_FIELD_NAME, INTROSPECTION_TYPE_FIELD_NAME,
+    META_FIELD_NAME, META_FIELD_TYPE,
+};
 use graph::schema::{ErrorPolicy, BLOCK_FIELD_TYPE};
 
 use crate::execution::{ast as a, Query};
@@ -101,6 +105,9 @@ impl StoreResolver {
     ) -> Result<Self, QueryExecutionError> {
         let store_clone = store.cheap_clone();
         let block_ptr = Self::locate_block(store_clone.as_ref(), bc, state).await?;
+
+        let blocks_behind = state.latest_block.number - block_ptr.ptr.number;
+        graphql_metrics.observe_query_blocks_behind(blocks_behind, &deployment);
 
         let has_non_fatal_errors = store
             .has_deterministic_errors(block_ptr.ptr.block_number())
@@ -283,7 +290,7 @@ impl StoreResolver {
 impl Resolver for StoreResolver {
     const CACHEABLE: bool = true;
 
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError> {
+    async fn query_permit(&self) -> Result<QueryPermit, QueryExecutionError> {
         self.store.query_permit().await.map_err(Into::into)
     }
 
@@ -382,12 +389,37 @@ impl Resolver for StoreResolver {
             // Note that the meta field could have been queried under a different response key,
             // or a different field queried under the response key `_meta`.
             ErrorPolicy::Deny => {
-                let data = result.take_data();
-                let meta =
-                    data.and_then(|mut d| d.remove("_meta").map(|m| ("_meta".to_string(), m)));
-                result.set_data(
-                    meta.map(|(key, value)| Object::from_iter(Some((Word::from(key), value)))),
-                );
+                let mut data = result.take_data();
+
+                // Only keep the _meta, __schema and __type fields from the data
+                let meta_fields = data.as_mut().and_then(|d| {
+                    let meta_field = d.remove(META_FIELD_NAME);
+                    let schema_field = d.remove(INTROSPECTION_SCHEMA_FIELD_NAME);
+                    let type_field = d.remove(INTROSPECTION_TYPE_FIELD_NAME);
+
+                    // combine the fields into a vector
+                    let mut meta_fields = Vec::new();
+
+                    if let Some(meta_field) = meta_field {
+                        meta_fields.push((Word::from(META_FIELD_NAME), meta_field));
+                    }
+                    if let Some(schema_field) = schema_field {
+                        meta_fields
+                            .push((Word::from(INTROSPECTION_SCHEMA_FIELD_NAME), schema_field));
+                    }
+                    if let Some(type_field) = type_field {
+                        meta_fields.push((Word::from(INTROSPECTION_TYPE_FIELD_NAME), type_field));
+                    }
+
+                    // return the object if it is not empty
+                    if meta_fields.is_empty() {
+                        None
+                    } else {
+                        Some(Object::from_iter(meta_fields))
+                    }
+                });
+
+                result.set_data(meta_fields);
             }
             ErrorPolicy::Allow => (),
         }

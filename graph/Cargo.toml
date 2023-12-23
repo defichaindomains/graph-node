@@ -7,10 +7,11 @@ edition.workspace = true
 anyhow = "1.0"
 async-trait = "0.1.50"
 async-stream = "0.3"
-atomic_refcell = "0.1.11"
+atomic_refcell = "0.1.13"
 bigdecimal = { version = "0.1.0", features = ["serde"] }
 bytes = "1.0.1"
-cid = "0.10.1"
+cid = "0.11.0"
+defer = "0.1"
 diesel = { version = "1.4.8", features = ["postgres", "serde_json", "numeric", "r2d2", "chrono"] }
 diesel_derives = "1.4"
 chrono = "0.4.31"
@@ -23,13 +24,14 @@ hex = "0.4.3"
 http = "0.2.3"
 futures = "0.1.21"
 graphql-parser = "0.4.0"
+humantime = "2.1.0"
 lazy_static = "1.4.0"
 num-bigint = { version = "^0.2.6", features = ["serde"] }
 num_cpus = "1.16.0"
-num-traits = "=0.2.16"
+num-traits = "=0.2.17"
 rand = "0.8.4"
 regex = "1.5.4"
-semver = { version = "1.0.18", features = ["serde"] }
+semver = { version = "1.0.20", features = ["serde"] }
 serde = { version = "1.0.126", features = ["rc"] }
 serde_derive = "1.0.125"
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
@@ -42,17 +44,17 @@ slog = { version = "2.7.0", features = ["release_max_level_trace", "max_level_tr
 stable-hash = { git = "https://github.com/graphprotocol/stable-hash", branch = "main"}
 stable-hash_legacy = { git = "https://github.com/graphprotocol/stable-hash", branch = "old", package = "stable-hash" }
 strum = "0.21.0"
-strum_macros = "0.25.2"
+strum_macros = "0.25.3"
 slog-async = "2.5.0"
 slog-envlogger = "2.1.0"
 slog-term = "2.7.0"
 petgraph = "0.6.4"
 tiny-keccak = "1.5.0"
-tokio = { version = "1.32.0", features = ["time", "sync", "macros", "test-util", "rt-multi-thread", "parking_lot"] }
+tokio = { version = "1.34.0", features = ["time", "sync", "macros", "test-util", "rt-multi-thread", "parking_lot"] }
 tokio-stream = { version = "0.1.14", features = ["sync"] }
 tokio-retry = "0.3.0"
-toml = "0.7.6"
-url = "2.4.1"
+toml = "0.8.8"
+url = "2.5.0"
 prometheus = "0.13.3"
 priority-queue = "0.7.0"
 tonic = { workspace = true }
@@ -63,7 +65,7 @@ futures03 = { version = "0.3.1", package = "futures", features = ["compat"] }
 wasmparser = "0.78.2"
 thiserror = "1.0.25"
 parking_lot = "0.12.1"
-itertools = "0.11.0"
+itertools = "0.12.0"
 
 # Our fork contains patches to make some fields optional for Celo and Fantom compatibility.
 # Without the "arbitrary_precision" feature, we get the error `data did not match any variant of untagged enum Response`.

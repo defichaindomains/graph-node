@@ -439,9 +439,6 @@ pub trait ChainStore: Send + Sync + 'static {
     /// The head block pointer will be None on initial set up.
     async fn chain_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error>;
 
-    /// In-memory time cached version of `chain_head_ptr`.
-    async fn cached_head_ptr(self: Arc<Self>) -> Result<Option<BlockPtr>, Error>;
-
     /// Get the current head block cursor for this chain.
     ///
     /// The head block cursor will be None on initial set up.
@@ -458,7 +455,10 @@ pub trait ChainStore: Send + Sync + 'static {
     ) -> Result<(), Error>;
 
     /// Returns the blocks present in the store.
-    fn blocks(&self, hashes: &[BlockHash]) -> Result<Vec<serde_json::Value>, Error>;
+    async fn blocks(
+        self: Arc<Self>,
+        hashes: Vec<BlockHash>,
+    ) -> Result<Vec<serde_json::Value>, Error>;
 
     /// Get the `offset`th ancestor of `block_hash`, where offset=0 means the block matching
     /// `block_hash` and offset=1 means its parent. Returns None if unable to complete due to
@@ -531,6 +531,11 @@ pub trait EthereumCallCache: Send + Sync + 'static {
     ) -> Result<(), Error>;
 }
 
+pub struct QueryPermit {
+    pub permit: tokio::sync::OwnedSemaphorePermit,
+    pub wait: Duration,
+}
+
 /// Store operations used when serving queries for a specific deployment
 #[async_trait]
 pub trait QueryStore: Send + Sync {
@@ -569,7 +574,7 @@ pub trait QueryStore: Send + Sync {
     fn network_name(&self) -> &str;
 
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
+    async fn query_permit(&self) -> Result<QueryPermit, StoreError>;
 
     /// Report the name of the shard in which the subgraph is stored. This
     /// should only be used for reporting and monitoring
@@ -584,7 +589,7 @@ pub trait QueryStore: Send + Sync {
 #[async_trait]
 pub trait StatusStore: Send + Sync + 'static {
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
+    async fn query_permit(&self) -> Result<QueryPermit, StoreError>;
 
     fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError>;
 

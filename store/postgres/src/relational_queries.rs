@@ -14,7 +14,7 @@ use diesel::Connection;
 
 use graph::components::store::write::WriteChunk;
 use graph::components::store::DerivedEntityQuery;
-use graph::data::store::{Id, NULL};
+use graph::data::store::{Id, IdType, NULL};
 use graph::data::store::{IdList, IdRef, QueryObject};
 use graph::data::value::{Object, Word};
 use graph::data_source::CausalityRegion;
@@ -35,7 +35,7 @@ use std::str::FromStr;
 
 use crate::block_range::BlockRange;
 use crate::relational::{
-    Column, ColumnType, IdType, Layout, SqlName, Table, BYTE_ARRAY_PREFIX_SIZE, PRIMARY_KEY_COLUMN,
+    Column, ColumnType, Layout, SqlName, Table, BYTE_ARRAY_PREFIX_SIZE, PRIMARY_KEY_COLUMN,
     STRING_PREFIX_SIZE,
 };
 use crate::{
@@ -102,12 +102,6 @@ macro_rules! constraint_violation {
     }}
 }
 
-/// Convert Postgres string representation of bytes "\xdeadbeef"
-/// to ours of just "deadbeef".
-fn bytes_as_str(id: &str) -> String {
-    id.trim_start_matches("\\x").to_owned()
-}
-
 /// Conveniences for handling foreign keys depending on whether we are using
 /// `IdType::Bytes` or `IdType::String` as the primary key
 ///
@@ -155,6 +149,7 @@ impl PushBindParam for Id {
         match self {
             Id::String(s) => out.push_bind_param::<Text, _>(s),
             Id::Bytes(b) => out.push_bind_param::<Binary, _>(&b.as_slice()),
+            Id::Int8(i) => out.push_bind_param::<Int8, _>(i),
         }
     }
 }
@@ -164,6 +159,7 @@ impl PushBindParam for IdList {
         match self {
             IdList::String(ids) => out.push_bind_param::<Array<Text>, _>(ids),
             IdList::Bytes(ids) => out.push_bind_param::<Array<Binary>, _>(ids),
+            IdList::Int8(ids) => out.push_bind_param::<Array<Int8>, _>(ids),
         }
     }
 }
@@ -173,6 +169,7 @@ impl<'a> PushBindParam for IdRef<'a> {
         match self {
             IdRef::String(s) => out.push_bind_param::<Text, _>(s),
             IdRef::Bytes(b) => out.push_bind_param::<Binary, _>(b),
+            IdRef::Int8(i) => out.push_bind_param::<Int8, _>(i),
         }
     }
 }
@@ -442,6 +439,24 @@ impl EntityDeletion {
     }
 }
 
+pub fn parse_id(id_type: IdType, json: serde_json::Value) -> Result<Id, StoreError> {
+    const HEX_PREFIX: &str = "\\x";
+    if let serde_json::Value::String(s) = json {
+        let s = if s.starts_with(HEX_PREFIX) {
+            Word::from(s.trim_start_matches(HEX_PREFIX))
+        } else {
+            Word::from(s)
+        };
+        id_type.parse(s).map_err(StoreError::from)
+    } else {
+        Err(graph::constraint_violation!(
+            "the value {:?} can not be converted into an id of type {}",
+            json,
+            id_type
+        ))
+    }
+}
+
 /// Helper struct for retrieving entities from the database. With diesel, we
 /// can only run queries that return columns whose number and type are known
 /// at compile time. Because of that, we retrieve the actual data for an
@@ -491,7 +506,7 @@ impl EntityData {
                                 parent_type
                                     .id_type()
                                     .map_err(StoreError::from)
-                                    .and_then(|id_type| id_type.parse_id(json)),
+                                    .and_then(|id_type| parse_id(id_type, json)),
                             ),
                         }
                     })
@@ -1009,6 +1024,8 @@ impl<'a> QueryFilter<'a> {
 
         out.push_sql(" where ");
 
+        let mut is_type_c_or_d = false;
+
         // Join tables
         if derived {
             // If the parent is derived,
@@ -1044,6 +1061,7 @@ impl<'a> QueryFilter<'a> {
                 .column_for_field(attribute)
                 .expect("Column for an attribute not found");
             let child_column = child_table.primary_key();
+            is_type_c_or_d = true;
 
             if parent_column.is_list() {
                 // Type C: i.id = any(c.child_ids)
@@ -1066,7 +1084,8 @@ impl<'a> QueryFilter<'a> {
         out.push_sql(" and ");
 
         // Match by block
-        BlockRangeColumn::new(child_table, child_prefix, self.block).contains(&mut out)?;
+        BlockRangeColumn::new(child_table, child_prefix, self.block)
+            .contains(&mut out, is_type_c_or_d)?;
 
         out.push_sql(" and ");
 
@@ -1486,7 +1505,7 @@ impl<'a> QueryFragment<Pg> for FindQuery<'a> {
             out.push_bind_param::<Integer, _>(&self.key.causality_region)?;
             out.push_sql(" and ");
         }
-        BlockRangeColumn::new(self.table, "e.", self.block).contains(&mut out)
+        BlockRangeColumn::new(self.table, "e.", self.block).contains(&mut out, true)
     }
 }
 
@@ -1645,7 +1664,7 @@ impl<'a> QueryFragment<Pg> for FindManyQuery<'a> {
                 out.push_bind_param::<Integer, _>(cr)?;
                 out.push_sql(" and ");
             }
-            BlockRangeColumn::new(table, "e.", self.block).contains(&mut out)?;
+            BlockRangeColumn::new(table, "e.", self.block).contains(&mut out, true)?;
         }
         Ok(())
     }
@@ -1718,7 +1737,7 @@ impl<'a> QueryFragment<Pg> for FindDerivedQuery<'a> {
             out.push_bind_param::<Integer, _>(causality_region)?;
             out.push_sql(" and ");
         }
-        BlockRangeColumn::new(self.table, "e.", self.block).contains(&mut out)
+        BlockRangeColumn::new(self.table, "e.", self.block).contains(&mut out, false)
     }
 }
 
@@ -2198,7 +2217,7 @@ impl<'a> FilterWindow<'a> {
         out.push_sql(" from ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
-        BlockRangeColumn::new(self.table, "c.", block).contains(out)?;
+        BlockRangeColumn::new(self.table, "c.", block).contains(out, false)?;
         limit.filter(out);
         out.push_sql(" and p.id = any(c.");
         out.push_identifier(column.name.as_str())?;
@@ -2234,7 +2253,7 @@ impl<'a> FilterWindow<'a> {
         out.push_sql(") as p(id), ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
-        BlockRangeColumn::new(self.table, "c.", block).contains(out)?;
+        BlockRangeColumn::new(self.table, "c.", block).contains(out, false)?;
         limit.filter(out);
         out.push_sql(" and c.");
         out.push_identifier(column.name.as_str())?;
@@ -2277,7 +2296,7 @@ impl<'a> FilterWindow<'a> {
         out.push_sql(" from ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
-        BlockRangeColumn::new(self.table, "c.", block).contains(out)?;
+        BlockRangeColumn::new(self.table, "c.", block).contains(out, false)?;
         limit.filter(out);
         out.push_sql(" and p.id = c.");
         out.push_identifier(column.name.as_str())?;
@@ -2307,7 +2326,7 @@ impl<'a> FilterWindow<'a> {
         out.push_sql(") as p(id), ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
-        BlockRangeColumn::new(self.table, "c.", block).contains(out)?;
+        BlockRangeColumn::new(self.table, "c.", block).contains(out, false)?;
         limit.filter(out);
         out.push_sql(" and p.id = c.");
         out.push_identifier(column.name.as_str())?;
@@ -2362,7 +2381,7 @@ impl<'a> FilterWindow<'a> {
             out.push_sql(" from ");
             out.push_sql(self.table.qualified_name.as_str());
             out.push_sql(" c where ");
-            BlockRangeColumn::new(self.table, "c.", block).contains(out)?;
+            BlockRangeColumn::new(self.table, "c.", block).contains(out, true)?;
             limit.filter(out);
             out.push_sql(" and c.id = any(p.child_ids)");
             self.and_filter(out.reborrow())?;
@@ -2404,7 +2423,7 @@ impl<'a> FilterWindow<'a> {
         out.push_sql(")) as p(id, child_id), ");
         out.push_sql(self.table.qualified_name.as_str());
         out.push_sql(" c where ");
-        BlockRangeColumn::new(self.table, "c.", block).contains(out)?;
+        BlockRangeColumn::new(self.table, "c.", block).contains(out, true)?;
         limit.filter(out);
 
         // Include a constraint on the child IDs as a set if the size of the set
@@ -3847,7 +3866,13 @@ impl<'a> FilterQuery<'a> {
         self.sort_key.add_child(self.block, &mut out)?;
 
         out.push_sql("\n where ");
-        BlockRangeColumn::new(table, "c.", self.block).contains(&mut out)?;
+
+        let filters_by_id = {
+            let entity_filter = table_filter.as_ref().map(|f| f.filter);
+            matches!(entity_filter, Some(EntityFilter::Equal(attr, _)) if attr == "id")
+        };
+
+        BlockRangeColumn::new(table, "c.", self.block).contains(&mut out, filters_by_id)?;
         if let Some(filter) = table_filter {
             out.push_sql(" and ");
             filter.walk_ast(out.reborrow())?;
@@ -4205,7 +4230,7 @@ impl<'a, Conn> RunQueryDsl<Conn> for ClampRangeQuery<'a> {}
 /// Helper struct for returning the id's touched by the RevertRemove and
 /// RevertExtend queries
 #[derive(QueryableByName, PartialEq, Eq, Hash)]
-pub struct ReturnedEntityData {
+struct ReturnedEntityData {
     #[sql_type = "Text"]
     pub id: String,
 }
@@ -4213,19 +4238,16 @@ pub struct ReturnedEntityData {
 impl ReturnedEntityData {
     /// Convert primary key ids from Postgres' internal form to the format we
     /// use by stripping `\\x` off the front of bytes strings
-    fn bytes_as_str(
-        table: &Table,
-        mut data: Vec<ReturnedEntityData>,
-    ) -> QueryResult<Vec<ReturnedEntityData>> {
-        match table.primary_key().column_type.id_type()? {
-            IdType::String => Ok(data),
-            IdType::Bytes => {
-                for entry in data.iter_mut() {
-                    entry.id = bytes_as_str(&entry.id);
-                }
-                Ok(data)
-            }
-        }
+    fn as_ids(table: &Table, data: Vec<ReturnedEntityData>) -> QueryResult<Vec<Id>> {
+        let id_type = table.primary_key().column_type.id_type()?;
+
+        data.into_iter()
+            .map(|s| match id_type {
+                IdType::String | IdType::Int8 => id_type.parse(Word::from(s.id)),
+                IdType::Bytes => id_type.parse(Word::from(s.id.trim_start_matches("\\x"))),
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|e| diesel::result::Error::DeserializationError(e.into()))
     }
 }
 
@@ -4269,10 +4291,10 @@ impl<'a> QueryId for RevertRemoveQuery<'a> {
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
-impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for RevertRemoveQuery<'a> {
-    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
+impl<'a> LoadQuery<PgConnection, Id> for RevertRemoveQuery<'a> {
+    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<Id>> {
         conn.query_by_name(&self)
-            .and_then(|data| ReturnedEntityData::bytes_as_str(self.table, data))
+            .and_then(|data| ReturnedEntityData::as_ids(self.table, data))
     }
 }
 
@@ -4352,10 +4374,10 @@ impl<'a> QueryId for RevertClampQuery<'a> {
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
-impl<'a> LoadQuery<PgConnection, ReturnedEntityData> for RevertClampQuery<'a> {
-    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<ReturnedEntityData>> {
+impl<'a> LoadQuery<PgConnection, Id> for RevertClampQuery<'a> {
+    fn internal_load(self, conn: &PgConnection) -> QueryResult<Vec<Id>> {
         conn.query_by_name(&self)
-            .and_then(|data| ReturnedEntityData::bytes_as_str(self.table, data))
+            .and_then(|data| ReturnedEntityData::as_ids(self.table, data))
     }
 }
 

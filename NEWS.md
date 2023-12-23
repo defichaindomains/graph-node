@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+## v0.33.0
+
+### What's New
+
+- **Arweave file data sources** - Arweave file data sources allow subgraph developers to access offchain data from Arweave from within the subgraph mappings.[(#4789)](https://github.com/graphprotocol/graph-node/pull/4789)
+- **Major performance boost for substreams-based subgraphs** - Significant performance improvements have been achieved for substreams-based subgraphs by moving substreams processing to the block stream.[(#4851)](https://github.com/graphprotocol/graph-node/pull/4851)
+- **Polling block handler** - A new block handler filter `polling` for `ethereum` data sources which enables subgraph developers to run a block handler at defined block intervals. This is useful for use cases such as taking periodic snapshots of the contract state.[(#4725)](https://github.com/graphprotocol/graph-node/pull/4725)
+- **Initialization handler** - A new block handler filter `once` for `ethereum` data sources which enables subgraph developers to create a handler which will be called only once before all other handlers run. This configuration allows the subgraph to use the handler as an initialization handler, performing specific tasks at the start of indexing. [(#4725)](https://github.com/graphprotocol/graph-node/pull/4725)
+- **DataSourceContext in manifest** - `DataSourceContext` in Manifest - DataSourceContext can now be defined in the subgraph manifest. It's a free-form map accessible from the mapping. This feature is useful for templating chain-specific data in subgraphs that use the same codebase across multiple chains.[(#4848)](https://github.com/graphprotocol/graph-node/pull/4848)
+- `graph-node` version in index node API - The Index Node API now features a new query, Version, which can be used to query the current graph-node version and commit. [(#4852)](https://github.com/graphprotocol/graph-node/pull/4852)
+- Added a '`paused`' field to Index Node API, a boolean indicating the subgraph’s pause status. [(#4779)](https://github.com/graphprotocol/graph-node/pull/4779)
+- Proof of Indexing logs now include block number [(#4798)](https://github.com/graphprotocol/graph-node/pull/4798)
+- `subgraph_features` table now tracks details about handlers used in a subgraph [(#4820)](https://github.com/graphprotocol/graph-node/pull/4820)
+- Configurable SSL for Postgres in Dockerfile -  ssl-mode for Postgres can now be configured via the connection string when deploying through Docker, offering enhanced flexibility in database security settings.[(#4840)](https://github.com/graphprotocol/graph-node/pull/4840)
+- Introspection Schema Update - The introspection schema has been updated to align with the October 2021 GraphQL specification update.[(#4676)](https://github.com/graphprotocol/graph-node/pull/4676)
+- `trace_id` Added to Substreams Logger [(#4868)](https://github.com/graphprotocol/graph-node/pull/4868)
+- New apiVersion for Mapping Validation - The latest apiVersion 0.0.8 validates that fields set in entities from the mappings are actually defined in the schema. This fixes a source of non-deterministic PoI. Subgraphs using this new API version will fail if they try to set undefined schema fields in the mappings. Its strongly recommended updating to 0.0.8 to avoid these issues. [(#4894)](https://github.com/graphprotocol/graph-node/pull/4894)
+- Substreams Block Ingestor Support - Added the ability to run a pure substreams chain by introducing a block ingestor for substreams-only chains. This feature allows users to run a chain with just a single substreams endpoint, enhancing support beyond RPC and firehose. Prior to this, a pure substreams chain couldn’t be synced.[(#4839)](https://github.com/graphprotocol/graph-node/pull/4839)
+
+### Bug fixes
+
+- Fix for rewinding dynamic data source - Resolved an issue where a rewind would fail to properly remove dynamic data sources when using `graphman rewind`. This has been fixed to ensure correct behavior.[(#4810)](https://github.com/graphprotocol/graph-node/pull/4810)
+- Improved Deployment Reliability with Retry Mechanism - A retry feature has been added to the block_pointer_from_number function to enhance the robustness of subgraph deployments. This resolves occasional failures encountered during deployment processes.[(#4812)](https://github.com/graphprotocol/graph-node/pull/4812)
+- Fixed Cross-Shard Grafting Issue - Addressed a bug that prevented cross-shard grafting from starting, causing the copy operation to stall at 0% progress. This issue occurred when a new shard was added after the primary shard had already been configured. The fix ensures that foreign tables and schemas are correctly set up in new shards. For existing installations experiencing this issue, it can be resolved by running `graphman database remap`.[(#4845)](https://github.com/graphprotocol/graph-node/pull/4845)
+- Fixed a Full-text search regression - Reverted a previous commit (ad1c6ea) that inadvertently limited the number of populated search indexes per entity.[(#4808)](https://github.com/graphprotocol/graph-node/pull/4808)
+- Attestable Error for Nested Child Filters - Nested child filter queries now return an attestable `ChildFilterNestingNotSupportedError`, improving error reporting for users.[(#4828)](https://github.com/graphprotocol/graph-node/pull/4828)
+
+### Graphman
+- **Index on prefixed fields** - The graphman index create command now correctly indexes prefixed fields of type String and Bytes for more query-efficient combined indexes. Note: For fields that are references to entities, the behavior may differ. The command may create an index using left(..) when it should index the column directly. 
+- **Partial Indexing for Recent Blocks** - The graphman index create command now includes a `--after $recent_block` flag for creating partial indexes focused on recent blocks. This enhances query performance similar to the effects of pruning. Queries using these partial indexes must include a specific clause for optimal performance.[(#4830)](https://github.com/graphprotocol/graph-node/pull/4830)
+
+<!--
+Not Relevant
+* Changes the spelling of History from Hostory by @vishal-sys in https://github.com/graphprotocol/graph-node/pull/4846
+* Test coverage for bundlr manifest + filename use case by @mangas in https://github.com/graphprotocol/graph-node/pull/4865
+* Revert most of PR 4827 by @lutter in https://github.com/graphprotocol/graph-node/pull/4860
+* Pass polling triggers only after start_block by @incrypto32 in https://github.com/graphprotocol/graph-node/pull/4881
+* Remove the entry from `subgraph_features` table when a subgraph is removed by @incrypto32 in https://github.com/graphprotocol/graph-node/pull/4811
+* Update docker-compose.yml by @computeronix in https://github.com/graphprotocol/graph-node/pull/4844
+ -->
+
+**Full Changelog**: https://github.com/graphprotocol/graph-node/compare/v0.33.0...e253ee14cda2d8456a86ae8f4e3f74a1a7979953
+
 ## v0.32.0
 
 ### What's New
@@ -34,7 +77,7 @@
 - Fixed `graph-node` panicking on the first startup when both Firehose and RPC providers are configured together. ([#4680](https://github.com/graphprotocol/graph-node/pull/4680))
 - Fixed block ingestor failing to startup with the error `net version for chain mainnet has changed from 0 to 1` when switching from Firehose to an RPC provider. ([#4692](https://github.com/graphprotocol/graph-node/pull/4692))
 - Fixed Firehose endpoints getting rate-limited due to duplicated providers during connection pool initialization. ([#4778](https://github.com/graphprotocol/graph-node/pull/4778))
-- Fixed a determinism issue where stale entities where being returned when using `get_many` and `get_derived` ([#4801]https://github.com/graphprotocol/graph-node/pull/4801)
+- Fixed a determinism issue where stale entities were being returned when using `get_many` and `get_derived` ([#4801]https://github.com/graphprotocol/graph-node/pull/4801)
 
 ### Graphman
 
@@ -206,7 +249,7 @@ Dependency upgrades:
   - `Qmccst5mbV5a6vT6VvJMLPKMAA1VRgT6NGbxkLL8eDRsE7`
   - `Qmd9nZKCH8UZU1pBzk7G8ECJr3jX3a2vAf3vowuTwFvrQg`
 
-  Here's an example [manifest](https://ipfs.io/ipfs/Qmd9nZKCH8UZU1pBzk7G8ECJr3jX3a2vAf3vowuTwFvrQg), taking a look at the data sources of name `ERC721` and `CryptoKitties`, both listen to the `Transfer(...)` event. Considering a block where there's only one occurence of this event, `graph-node` would duplicate it and call `handleTransfer` twice. Now this is fixed and it will be called only once per event/call that happened on chain.
+  Here's an example [manifest](https://ipfs.io/ipfs/Qmd9nZKCH8UZU1pBzk7G8ECJr3jX3a2vAf3vowuTwFvrQg), taking a look at the data sources of name `ERC721` and `CryptoKitties`, both listen to the `Transfer(...)` event. Considering a block where there's only one occurrence of this event, `graph-node` would duplicate it and call `handleTransfer` twice. Now this is fixed and it will be called only once per event/call that happened on chain.
 
   In the case you're indexing one of the impacted subgraphs, you should first upgrade the `graph-node` version, then rewind the affected subgraphs to the smallest `startBlock` of their subgraph manifest. To achieve that the `graphman rewind` CLI command can be used.
 
@@ -586,7 +629,7 @@ This release ships support for API version 0.0.6 in mappings:
 
 #### Block Cache Invalidation and Reset
 
-All cached block data must be refetched to account for the new `Block` and `Trasaction`
+All cached block data must be refetched to account for the new `Block` and `Transaction`
 struct versions, so this release includes a `graph-node` startup check that will:
 
 1. Truncate all block cache tables.

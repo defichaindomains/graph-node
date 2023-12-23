@@ -51,6 +51,7 @@ pub struct DataSource {
     pub manifest_idx: u32,
     pub address: Option<Address>,
     pub start_block: BlockNumber,
+    pub end_block: Option<BlockNumber>,
     pub mapping: Mapping,
     pub context: Arc<Option<DataSourceContext>>,
     pub creation_block: Option<BlockNumber>,
@@ -99,6 +100,7 @@ impl blockchain::DataSource<Chain> for DataSource {
             manifest_idx: template.manifest_idx,
             address: Some(address),
             start_block: creation_block,
+            end_block: None,
             mapping: template.mapping,
             context: Arc::new(context),
             creation_block: Some(creation_block),
@@ -135,6 +137,10 @@ impl blockchain::DataSource<Chain> for DataSource {
 
     fn start_block(&self) -> BlockNumber {
         self.start_block
+    }
+
+    fn end_block(&self) -> Option<BlockNumber> {
+        self.end_block
     }
 
     fn match_and_decode(
@@ -176,12 +182,12 @@ impl blockchain::DataSource<Chain> for DataSource {
             address,
             mapping,
             context,
-
             // The creation block is ignored for detection duplicate data sources.
             // Contract ABI equality is implicit in `mapping.abis` equality.
             creation_block: _,
             contract_abi: _,
             start_block: _,
+            end_block: _,
         } = self;
 
         // mapping_request_sender, host_metrics, and (most of) host_exports are operational structs
@@ -247,6 +253,7 @@ impl blockchain::DataSource<Chain> for DataSource {
             manifest_idx,
             address,
             start_block: creation_block.unwrap_or(0),
+            end_block: None,
             mapping: template.mapping.clone(),
             context: Arc::new(context),
             creation_block,
@@ -382,6 +389,7 @@ impl DataSource {
             manifest_idx,
             address: source.address,
             start_block: source.start_block,
+            end_block: source.end_block,
             mapping,
             context: Arc::new(context),
             creation_block,
@@ -389,19 +397,20 @@ impl DataSource {
         })
     }
 
-    fn handlers_for_log(&self, log: &Log) -> Result<Vec<MappingEventHandler>, Error> {
+    fn handlers_for_log(&self, log: &Log) -> Vec<MappingEventHandler> {
         // Get signature from the log
-        let topic0 = log.topics.get(0).context("Ethereum event has no topics")?;
+        let topic0 = match log.topics.get(0) {
+            Some(topic0) => topic0,
+            // Events without a topic should just be be ignored
+            None => return vec![],
+        };
 
-        let handlers = self
-            .mapping
+        self.mapping
             .event_handlers
             .iter()
             .filter(|handler| *topic0 == handler.topic0())
             .cloned()
-            .collect::<Vec<_>>();
-
-        Ok(handlers)
+            .collect::<Vec<_>>()
     }
 
     fn handler_for_call(&self, call: &EthereumCall) -> Result<Option<MappingCallHandler>, Error> {
@@ -637,8 +646,10 @@ impl DataSource {
                     block.block_ptr(),
                 )))
             }
-            EthereumTrigger::Log(log, receipt) => {
-                let potential_handlers = self.handlers_for_log(log)?;
+            EthereumTrigger::Log(log_ref) => {
+                let log = Arc::new(log_ref.log().clone());
+                let receipt = log_ref.receipt();
+                let potential_handlers = self.handlers_for_log(&log);
 
                 // Map event handlers to (event handler, event ABI) pairs; fail if there are
                 // handlers that don't exist in the contract ABI
@@ -713,7 +724,7 @@ impl DataSource {
                 // See also ca0edc58-0ec5-4c89-a7dd-2241797f5e50.
                 let transaction = if log.transaction_hash != block.hash {
                     block
-                        .transaction_for_log(log)
+                        .transaction_for_log(&log)
                         .context("Found no transaction for event")?
                 } else {
                     // Infer some fields from the log and fill the rest with zeros.
@@ -736,9 +747,9 @@ impl DataSource {
                     MappingTrigger::Log {
                         block: block.cheap_clone(),
                         transaction: Arc::new(transaction),
-                        log: log.cheap_clone(),
+                        log: log,
                         params,
-                        receipt: receipt.clone(),
+                        receipt: receipt.map(|r| r.cheap_clone()),
                     },
                     event_handler.handler,
                     block.block_ptr(),

@@ -8,7 +8,7 @@ use graph::blockchain::block_stream::FirehoseCursor;
 use graph::components::store::write::RowGroup;
 use graph::components::store::{
     Batch, DerivedEntityQuery, PrunePhase, PruneReporter, PruneRequest, PruningStrategy,
-    StoredDynamicDataSource, VersionStats,
+    QueryPermit, StoredDynamicDataSource, VersionStats,
 };
 use graph::components::versions::VERSIONS;
 use graph::data::query::Trace;
@@ -17,7 +17,7 @@ use graph::data::subgraph::{status, SPEC_VERSION_0_0_6};
 use graph::data_source::CausalityRegion;
 use graph::prelude::futures03::FutureExt;
 use graph::prelude::{
-    tokio, ApiVersion, CancelHandle, CancelToken, CancelableError, EntityOperation, PoolWaitStats,
+    ApiVersion, CancelHandle, CancelToken, CancelableError, EntityOperation, PoolWaitStats,
     SubgraphDeploymentEntity,
 };
 use graph::semver::Version;
@@ -27,7 +27,6 @@ use lru_time_cache::LruCache;
 use rand::{seq::SliceRandom, thread_rng};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Into;
-use std::iter::FromIterator;
 use std::ops::Bound;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -52,9 +51,7 @@ use crate::detail::ErrorDetail;
 use crate::dynds::DataSourcesTable;
 use crate::primary::DeploymentId;
 use crate::relational::index::{CreateIndex, Method};
-use crate::relational::{
-    ColumnType, Layout, LayoutCache, SqlName, Table, BYTE_ARRAY_PREFIX_SIZE, STRING_PREFIX_SIZE,
-};
+use crate::relational::{Layout, LayoutCache, SqlName, Table};
 use crate::relational_queries::FromEntityData;
 use crate::{advisory_lock, catalog, retry};
 use crate::{connection_pool::ConnectionPool, detail};
@@ -291,18 +288,8 @@ impl DeploymentStore {
         // if that's Fred the Dog, Fred the Cat or both.
         //
         // This assumes that there are no concurrent writes to a subgraph.
-        let schema = self.subgraph_info_with_conn(conn, &layout.site)?.input;
         let entity_type_str = entity_type.to_string();
-        let types_with_shared_interface = Vec::from_iter(
-            schema
-                .interfaces_for_type(entity_type.as_str())
-                .into_iter()
-                .flatten()
-                .flat_map(|interface| schema.types_for_interface(interface))
-                .flatten()
-                .map(|object_type| schema.entity_type(object_type).unwrap())
-                .filter(|type_name| type_name != entity_type),
-        );
+        let types_with_shared_interface = entity_type.share_interfaces()?;
 
         if !types_with_shared_interface.is_empty() {
             if let Some(conflicting_entity) =
@@ -427,10 +414,7 @@ impl DeploymentStore {
         Ok(conn)
     }
 
-    pub(crate) async fn query_permit(
-        &self,
-        replica: ReplicaId,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
+    pub(crate) async fn query_permit(&self, replica: ReplicaId) -> Result<QueryPermit, StoreError> {
         let pool = match replica {
             ReplicaId::Main => &self.pool,
             ReplicaId::ReadOnly(idx) => &self.read_only_pools[idx],
@@ -669,10 +653,8 @@ impl DeploymentStore {
 
         conn.transaction(|| {
             for table in tables {
-                let columns = resolve_column_names(table, &columns)?
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<&SqlName>>();
+                let (columns, _) = resolve_column_names_and_index_exprs(table, &columns)?;
+
                 catalog::set_stats_target(&conn, &site.namespace, &table.name, &columns, target)?;
             }
             Ok(())
@@ -710,28 +692,21 @@ impl DeploymentStore {
             let schema_name = site.namespace.clone();
             let layout = store.layout(conn, site)?;
             let table = resolve_table_name(&layout, &entity_name)?;
-            let column_names_to_types = resolve_column_names(table, &field_names)?;
-            let column_names = column_names_to_types
-                .iter()
-                .map(|(name, _)| *name)
-                .collect::<Vec<&SqlName>>();
+            let (column_names, index_exprs) =
+                resolve_column_names_and_index_exprs(table, &field_names)?;
 
             let column_names_sep_by_underscores = column_names.join("_");
-            let index_exprs = resolve_index_exprs(column_names_to_types);
+            let index_exprs_joined = index_exprs.join(", ");
             let table_name = &table.name;
             let index_name = format!(
                 "manual_{table_name}_{column_names_sep_by_underscores}{}",
-                if let Some(after_value) = after {
-                    format!("_{}", after_value)
-                } else {
-                    String::new()
-                }
+                after.map_or_else(String::new, |a| format!("_{}", a))
             );
 
             let mut sql = format!(
                 "create index concurrently if not exists {index_name} \
                  on {schema_name}.{table_name} using {index_method} \
-                 ({index_exprs}) ",
+                 ({index_exprs_joined}) ",
             );
 
             // If 'after' is provided and the table is not immutable, add a WHERE clause for partial indexing
@@ -1854,7 +1829,10 @@ impl DeploymentStore {
 /// search using the latter if the search for the former fails.
 fn resolve_table_name<'a>(layout: &'a Layout, name: &'_ str) -> Result<&'a Table, StoreError> {
     layout
-        .table_for_entity(&layout.input_schema.entity_type(name)?)
+        .input_schema
+        .entity_type(name)
+        .map_err(StoreError::from)
+        .and_then(|et| layout.table_for_entity(&et))
         .map(Deref::deref)
         .or_else(|_error| {
             let sql_name = SqlName::from(name);
@@ -1868,51 +1846,45 @@ fn resolve_table_name<'a>(layout: &'a Layout, name: &'_ str) -> Result<&'a Table
 /// either GraphQL attributes or the SQL names of columns. We also accept
 /// the names `block_range` and `block$` and map that to the correct name
 /// for the block range column for that table.
-fn resolve_column_names<'a, T: AsRef<str>>(
+fn resolve_column_names_and_index_exprs<'a, T: AsRef<str>>(
     table: &'a Table,
     field_names: &[T],
-) -> Result<Vec<(&'a SqlName, Option<&'a ColumnType>)>, StoreError> {
-    fn lookup<'a>(
-        table: &'a Table,
-        field: &str,
-    ) -> Result<(&'a SqlName, &'a ColumnType), StoreError> {
-        table
-            .column_for_field(field)
-            .or_else(|_error| {
-                let sql_name = SqlName::from(field);
-                table
-                    .column(&sql_name)
-                    .ok_or_else(|| StoreError::UnknownField(field.to_string()))
-            })
-            .map(|column| (&column.name, &column.column_type))
+) -> Result<(Vec<&'a SqlName>, Vec<String>), StoreError> {
+    let mut column_names = Vec::new();
+    let mut index_exprs = Vec::new();
+
+    for field in field_names {
+        let (column_name, index_expr) =
+            if field.as_ref() == BLOCK_RANGE_COLUMN || field.as_ref() == BLOCK_COLUMN {
+                let name = table.block_column();
+                (name, name.to_string())
+            } else {
+                resolve_column(table, field.as_ref())?
+            };
+
+        column_names.push(column_name);
+        index_exprs.push(index_expr);
     }
 
-    field_names
-        .iter()
-        .map(|f| {
-            if f.as_ref() == BLOCK_RANGE_COLUMN || f.as_ref() == BLOCK_COLUMN {
-                Ok((table.block_column(), None))
-            } else {
-                lookup(table, f.as_ref()).map(|(name, column_type)| (name, Some(column_type)))
-            }
-        })
-        .collect()
+    Ok((column_names, index_exprs))
 }
 
-fn resolve_index_exprs(column_names_to_types: Vec<(&SqlName, Option<&ColumnType>)>) -> String {
-    column_names_to_types
-        .iter()
-        .map(|(name, column_type)| match column_type {
-            Some(ColumnType::String) => {
-                format!("left({}, {})", name, STRING_PREFIX_SIZE)
-            }
-            Some(ColumnType::Bytes) => {
-                format!("substring({}, 1, {})", name, BYTE_ARRAY_PREFIX_SIZE)
-            }
-            _ => name.to_string(),
+/// Resolves a column name against the `table`. The `field` can be
+/// either GraphQL attribute or the SQL name of a column.
+fn resolve_column<'a>(table: &'a Table, field: &str) -> Result<(&'a SqlName, String), StoreError> {
+    table
+        .column_for_field(field)
+        .or_else(|_| {
+            let sql_name = SqlName::from(field);
+            table
+                .column(&sql_name)
+                .ok_or_else(|| StoreError::UnknownField(field.to_string()))
         })
-        .collect::<Vec<String>>()
-        .join(",")
+        .map(|column| {
+            let index_expr =
+                Table::calculate_index_method_and_expression(table.immutable, column).1;
+            (&column.name, index_expr)
+        })
 }
 
 /// A helper to log progress during pruning that is kicked off from

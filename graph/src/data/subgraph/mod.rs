@@ -419,6 +419,7 @@ impl UnresolvedSchema {
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Source {
     /// The contract address for the data source. We allow data sources
     /// without an address for 'wildcard' triggers that catch all possible
@@ -426,8 +427,9 @@ pub struct Source {
     #[serde(default, deserialize_with = "deserialize_address")]
     pub address: Option<Address>,
     pub abi: String,
-    #[serde(rename = "startBlock", default)]
+    #[serde(default)]
     pub start_block: BlockNumber,
+    pub end_block: Option<BlockNumber>,
 }
 
 pub fn calls_host_fn(runtime: &[u8], host_fn: &str) -> anyhow::Result<bool> {
@@ -540,6 +542,13 @@ pub struct BaseSubgraphManifest<C, S, D, T> {
     pub templates: Vec<T>,
     #[serde(skip_serializing, default)]
     pub chain: PhantomData<C>,
+    pub indexer_hints: Option<IndexerHints>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexerHints {
+    pub history_blocks: Option<BlockNumber>,
 }
 
 /// SubgraphManifest with IPFS links unresolved
@@ -613,17 +622,6 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             _ => errors.push(SubgraphManifestValidationError::MultipleEthereumNetworks),
         }
 
-        self.0
-            .schema
-            .validate()
-            .err()
-            .into_iter()
-            .for_each(|schema_errors| {
-                errors.push(SubgraphManifestValidationError::SchemaValidationError(
-                    schema_errors,
-                ));
-            });
-
         if let Some(graft) = &self.0.graft {
             if validate_graft_base {
                 if let Err(graft_err) = graft.validate(store).await {
@@ -681,6 +679,12 @@ impl<C: Blockchain> SubgraphManifest<C> {
             .iter()
             .filter_map(|d| Some(d.as_onchain()?.start_block()))
             .collect()
+    }
+
+    pub fn history_blocks(&self) -> Option<BlockNumber> {
+        self.indexer_hints
+            .as_ref()
+            .and_then(|hints| hints.history_blocks)
     }
 
     pub fn api_versions(&self) -> impl Iterator<Item = semver::Version> + '_ {
@@ -797,6 +801,7 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             graft,
             templates,
             chain,
+            indexer_hints,
         } = self;
 
         if !(MIN_SPEC_VERSION..=max_spec_version.clone()).contains(&spec_version) {
@@ -858,6 +863,22 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             );
         }
 
+        if spec_version < SPEC_VERSION_0_0_9
+            && data_sources.iter().any(|ds| ds.end_block().is_some())
+        {
+            bail!(
+                "Defining `endBlock` in the manifest is not supported prior to {}",
+                SPEC_VERSION_0_0_9
+            );
+        }
+
+        if spec_version < SPEC_VERSION_0_1_0 && indexer_hints.is_some() {
+            bail!(
+                "`indexerHints` are not supported prior to {}",
+                SPEC_VERSION_0_1_0
+            );
+        }
+
         // Check the min_spec_version of each data source against the spec version of the subgraph
         let min_spec_version_mismatch = data_sources
             .iter()
@@ -884,6 +905,7 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
             graft,
             templates,
             chain,
+            indexer_hints,
         })
     }
 }

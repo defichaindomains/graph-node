@@ -1,4 +1,5 @@
-use graph::data::store::scalar;
+use graph::components::metrics::gas::GasMetrics;
+use graph::data::store::{scalar, Id, IdType};
 use graph::data::subgraph::*;
 use graph::data::value::Word;
 use graph::prelude::web3::types::U256;
@@ -91,11 +92,16 @@ async fn test_valid_module_and_store_with_timeout(
         deployment_id.clone(),
         "test",
         metrics_registry.clone(),
+        "test_shard".to_string(),
     );
+
+    let gas_metrics = GasMetrics::new(deployment_id.clone(), metrics_registry.clone());
+
     let host_metrics = Arc::new(HostMetrics::new(
         metrics_registry,
         deployment_id.as_str(),
         stopwatch_metrics,
+        gas_metrics,
     ));
 
     let experimental_features = ExperimentalFeatures {
@@ -1226,8 +1232,13 @@ struct Host {
 }
 
 impl Host {
-    async fn new(schema: &str, deployment_hash: &str, wasm_file: &str) -> Host {
-        let version = ENV_VARS.mappings.max_api_version.clone();
+    async fn new(
+        schema: &str,
+        deployment_hash: &str,
+        wasm_file: &str,
+        api_version: Option<Version>,
+    ) -> Host {
+        let version = api_version.unwrap_or(ENV_VARS.mappings.max_api_version.clone());
         let wasm_file = wasm_file_path(wasm_file, API_VERSION_0_0_5);
 
         let ds = mock_data_source(&wasm_file, version.clone());
@@ -1238,14 +1249,17 @@ impl Host {
         let ctx = mock_context(deployment.clone(), ds, store.subgraph_store(), version);
         let host_exports = host_exports::test_support::HostExports::new(&ctx);
 
-        let metrics_registry = Arc::new(MetricsRegistry::mock());
+        let metrics_registry: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
         let stopwatch = StopwatchMetrics::new(
             ctx.logger.clone(),
             deployment.hash.clone(),
             "test",
             metrics_registry.clone(),
+            "test_shard".to_string(),
         );
-        let gas = GasCounter::new();
+        let gas_metrics = GasMetrics::new(deployment.hash.clone(), metrics_registry);
+
+        let gas = GasCounter::new(gas_metrics);
 
         Host {
             ctx,
@@ -1276,6 +1290,7 @@ impl Host {
         self.host_exports.store_set(
             &self.ctx.logger,
             &mut self.ctx.state,
+            12, // Arbitrary block number
             &self.ctx.proof_of_indexing,
             entity_type.to_string(),
             id,
@@ -1325,7 +1340,7 @@ async fn test_store_set_id() {
         name: String,
     }";
 
-    let mut host = Host::new(schema, "hostStoreSetId", "boolean.wasm").await;
+    let mut host = Host::new(schema, "hostStoreSetId", "boolean.wasm", None).await;
 
     host.store_set(USER, UID, vec![("id", "u1"), ("name", "user1")])
         .expect("setting with same id works");
@@ -1428,7 +1443,13 @@ async fn test_store_set_invalid_fields() {
         test2: String
     }";
 
-    let mut host = Host::new(schema, "hostStoreSetInvalidFields", "boolean.wasm").await;
+    let mut host = Host::new(
+        schema,
+        "hostStoreSetInvalidFields",
+        "boolean.wasm",
+        Some(API_VERSION_0_0_8),
+    )
+    .await;
 
     host.store_set(USER, UID, vec![("id", "u1"), ("name", "user1")])
         .unwrap();
@@ -1450,9 +1471,7 @@ async fn test_store_set_invalid_fields() {
     // The order of `test` and `test2` is not guranteed
     // So we just check the string contains them
     let err_string = err.to_string();
-    dbg!(err_string.as_str());
-    assert!(err_string
-        .contains("The provided entity has fields not defined in the schema for entity `User`"));
+    assert!(err_string.contains("Attempted to set undefined fields [test, test2] for the entity type `User`. Make sure those fields are defined in the schema."));
 
     let err = host
         .store_set(
@@ -1463,8 +1482,93 @@ async fn test_store_set_invalid_fields() {
         .err()
         .unwrap();
 
-    err_says(
-        err,
-        "Unknown key `test3`. It probably is not part of the schema",
+    err_says(err, "Attempted to set undefined fields [test3] for the entity type `User`. Make sure those fields are defined in the schema.");
+
+    // For apiVersion below 0.0.8, we should not error out
+    let mut host2 = Host::new(
+        schema,
+        "hostStoreSetInvalidFields",
+        "boolean.wasm",
+        Some(API_VERSION_0_0_7),
     )
+    .await;
+
+    let err_is_none = host2
+        .store_set(
+            USER,
+            UID,
+            vec![
+                ("id", "u1"),
+                ("name", "user1"),
+                ("test", "invalid_field"),
+                ("test2", "invalid_field"),
+            ],
+        )
+        .err()
+        .is_none();
+
+    assert!(err_is_none);
+}
+
+/// Test generating ids through `store_set`
+#[tokio::test]
+async fn generate_id() {
+    const AUTO: &str = "auto";
+    const INT8: &str = "Int8";
+    const BINARY: &str = "Binary";
+
+    let schema = "type Int8 @entity(immutable: true) {
+        id: Int8!,
+        name: String,
+    }
+
+    type Binary @entity(immutable: true) {
+        id: Bytes!,
+        name: String,
+    }";
+
+    let mut host = Host::new(schema, "hostGenerateId", "boolean.wasm", None).await;
+
+    // Since these entities are immutable, storing twice would generate an
+    // error; but since the ids are autogenerated, each invocation creates a
+    // new id. Note that the types of the ids have an incorrect type, but
+    // that doesn't matter since they get overwritten.
+    host.store_set(INT8, AUTO, vec![("id", "u1"), ("name", "int1")])
+        .expect("setting auto works");
+    host.store_set(INT8, AUTO, vec![("id", "u1"), ("name", "int2")])
+        .expect("setting auto works");
+    host.store_set(BINARY, AUTO, vec![("id", "u1"), ("name", "bin1")])
+        .expect("setting auto works");
+    host.store_set(BINARY, AUTO, vec![("id", "u1"), ("name", "bin2")])
+        .expect("setting auto works");
+
+    let entity_cache = host.ctx.state.entity_cache;
+    let mods = entity_cache.as_modifications(12).unwrap().modifications;
+    let id_map: HashMap<&str, Id> = HashMap::from_iter(
+        vec![
+            (
+                "bin1",
+                IdType::Bytes.parse("0x0000000c00000002".into()).unwrap(),
+            ),
+            (
+                "bin2",
+                IdType::Bytes.parse("0x0000000c00000003".into()).unwrap(),
+            ),
+            ("int1", Id::Int8(0x0000_000c__0000_0000)),
+            ("int2", Id::Int8(0x0000_000c__0000_0001)),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(4, mods.len());
+    for m in &mods {
+        match m {
+            EntityModification::Insert { data, .. } => {
+                let id = data.get("id").unwrap();
+                let name = data.get("name").unwrap().as_str().unwrap();
+                let exp = id_map.get(name).unwrap();
+                assert_eq!(exp, id, "Wrong id for entity with name `{name}`");
+            }
+            _ => panic!("expected Insert modification"),
+        }
+    }
 }

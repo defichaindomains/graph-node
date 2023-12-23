@@ -30,9 +30,9 @@ use graph::data::graphql::TypeExt as _;
 use graph::data::query::Trace;
 use graph::data::value::Word;
 use graph::data_source::CausalityRegion;
-use graph::prelude::{q, s, serde_json, EntityQuery, StopwatchMetrics, ENV_VARS};
+use graph::prelude::{q, EntityQuery, StopwatchMetrics, ENV_VARS};
 use graph::schema::{
-    EntityKey, EntityType, FulltextConfig, FulltextDefinition, InputSchema, SCHEMA_TYPE_NAME,
+    EntityKey, EntityType, Field, FulltextConfig, FulltextDefinition, InputSchema,
 };
 use graph::slog::warn;
 use inflector::Inflector;
@@ -55,8 +55,7 @@ use crate::{
     },
 };
 use graph::components::store::DerivedEntityQuery;
-use graph::data::graphql::ext::{DirectiveFinder, ObjectTypeExt};
-use graph::data::store::{Id, IdList, BYTES_SCALAR};
+use graph::data::store::{Id, IdList, IdType, BYTES_SCALAR};
 use graph::data::subgraph::schema::POI_TABLE;
 use graph::prelude::{
     anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityOperation, Logger,
@@ -188,86 +187,6 @@ impl ToSql<Text, Pg> for SqlName {
     }
 }
 
-/// The SQL type to use for GraphQL ID properties. We support
-/// strings and byte arrays
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) enum IdType {
-    String,
-    Bytes,
-}
-
-impl IdType {
-    pub fn parse_id(self, json: serde_json::Value) -> Result<Id, StoreError> {
-        const HEX_PREFIX: &str = "\\x";
-        let id_type = graph::data::store::IdType::from(self);
-        if let serde_json::Value::String(s) = json {
-            let s = if s.starts_with(HEX_PREFIX) {
-                Word::from(s.trim_start_matches(HEX_PREFIX))
-            } else {
-                Word::from(s)
-            };
-            id_type.parse(s).map_err(StoreError::from)
-        } else {
-            Err(graph::constraint_violation!(
-                "the value {:?} can not be converted into an id of type {}",
-                json,
-                self
-            ))
-        }
-    }
-}
-
-impl TryFrom<&s::ObjectType> for IdType {
-    type Error = StoreError;
-
-    fn try_from(obj_type: &s::ObjectType) -> Result<Self, Self::Error> {
-        let pk = obj_type
-            .field(PRIMARY_KEY_COLUMN)
-            .expect("Each ObjectType has an `id` field");
-        Self::try_from(&pk.field_type)
-    }
-}
-
-impl TryFrom<&s::Type> for IdType {
-    type Error = StoreError;
-
-    fn try_from(field_type: &s::Type) -> Result<Self, Self::Error> {
-        let name = named_type(field_type);
-
-        match ValueType::from_str(name)? {
-            ValueType::String => Ok(IdType::String),
-            ValueType::Bytes => Ok(IdType::Bytes),
-            _ => Err(anyhow!(
-                "The `id` field has type `{}` but only `String`, `Bytes`, and `ID` are allowed",
-                &name
-            )
-            .into()),
-        }
-    }
-}
-
-impl From<IdType> for graph::data::store::IdType {
-    fn from(id_type: IdType) -> Self {
-        match id_type {
-            IdType::String => graph::data::store::IdType::String,
-            IdType::Bytes => graph::data::store::IdType::Bytes,
-        }
-    }
-}
-
-impl std::fmt::Display for IdType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IdType::String => write!(f, "String"),
-            IdType::Bytes => write!(f, "Bytes"),
-        }
-    }
-}
-
-type IdTypeMap = HashMap<EntityType, IdType>;
-
-type EnumMap = BTreeMap<String, Arc<BTreeSet<String>>>;
-
 #[derive(Debug, Clone)]
 pub struct Layout {
     /// Details of where the subgraph is stored
@@ -276,9 +195,6 @@ pub struct Layout {
     pub tables: HashMap<EntityType, Arc<Table>>,
     /// The database schema for this subgraph
     pub catalog: Catalog,
-    /// Enums defined in the schema and their possible values. The names
-    /// are the original GraphQL names
-    pub enums: EnumMap,
     /// The query to count all entities
     pub count_query: String,
     /// How many blocks of history the subgraph should keep
@@ -296,87 +212,28 @@ impl Layout {
         schema: &InputSchema,
         catalog: Catalog,
     ) -> Result<Self, StoreError> {
-        // Extract enum types
-        let enums: EnumMap = schema
-            .get_enum_definitions()
+        // Check that enum type names are valid for SQL
+        for name in schema.enum_types() {
+            SqlName::check_valid_identifier(name, "enum")?;
+        }
+
+        // Construct a Table struct for each entity type, except for PoI
+        // since we handle that specially
+        let mut tables = schema
+            .entity_types()
             .iter()
-            .map(
-                |enum_type| -> Result<(String, Arc<BTreeSet<String>>), StoreError> {
-                    SqlName::check_valid_identifier(&enum_type.name, "enum")?;
-                    Ok((
-                        enum_type.name.clone(),
-                        Arc::new(
-                            enum_type
-                                .values
-                                .iter()
-                                .map(|value| value.name.clone())
-                                .collect::<BTreeSet<_>>(),
-                        ),
-                    ))
-                },
-            )
-            .collect::<Result<_, _>>()?;
-
-        // List of all object types that are not __SCHEMA__
-        let object_types = schema
-            .get_object_type_definitions()
-            .into_iter()
-            .filter(|obj_type| obj_type.name != SCHEMA_TYPE_NAME)
-            .collect::<Vec<_>>();
-
-        // For interfaces, check that all implementors use the same IdType
-        // and build a list of name/IdType pairs
-        let id_types_for_interface = schema.interface_types().iter().map(|(interface, types)| {
-            types
-                .iter()
-                .map(IdType::try_from)
-                .collect::<Result<HashSet<_>, _>>()
-                .and_then(move |types| {
-                    if types.len() > 1 {
-                        Err(anyhow!(
-                            "The implementations of interface \
-                            `{}` use different types for the `id` field",
-                            interface
-                        )
-                        .into())
-                    } else {
-                        // For interfaces that are not implemented at all, pretend
-                        // they have a String `id` field
-                        // see also: id-type-for-unimplemented-interfaces
-                        let id_type = types.iter().next().cloned().unwrap_or(IdType::String);
-                        Ok((schema.entity_type(interface).unwrap(), id_type))
-                    }
-                })
-        });
-
-        // Map of type name to the type of the ID column for the object_types
-        // and interfaces in the schema
-        let id_types = object_types
-            .iter()
-            .map(|obj_type| {
-                IdType::try_from(*obj_type).map(|t| (schema.entity_type(*obj_type).unwrap(), t))
-            })
-            .chain(id_types_for_interface)
-            .collect::<Result<IdTypeMap, _>>()?;
-
-        // Construct a Table struct for each ObjectType
-        let mut tables = object_types
-            .iter()
+            .filter(|entity_type| !entity_type.is_poi())
             .enumerate()
-            .map(|(i, obj_type)| {
+            .map(|(i, entity_type)| {
                 Table::new(
                     schema,
-                    obj_type,
+                    entity_type,
                     &catalog,
                     schema
-                        .entity_fulltext_definitions(&obj_type.name)
+                        .entity_fulltext_definitions(entity_type.as_str())
                         .map_err(|_| StoreError::FulltextSearchNonDeterministic)?,
-                    &enums,
-                    &id_types,
                     i as u32,
-                    catalog
-                        .entities_with_causality_region
-                        .contains(&schema.entity_type(*obj_type).unwrap()),
+                    catalog.entities_with_causality_region.contains(entity_type),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -416,7 +273,6 @@ impl Layout {
             site,
             catalog,
             tables,
-            enums,
             count_query,
             history_blocks: i32::MAX,
             input_schema: schema.cheap_clone(),
@@ -435,7 +291,7 @@ impl Layout {
             columns: vec![
                 Column {
                     name: SqlName::from(poi_digest.as_str()),
-                    field: poi_digest.to_string(),
+                    field: poi_digest,
                     field_type: q::Type::NonNullType(Box::new(q::Type::NamedType(
                         BYTES_SCALAR.to_owned(),
                     ))),
@@ -446,7 +302,7 @@ impl Layout {
                 },
                 Column {
                     name: SqlName::from(PRIMARY_KEY_COLUMN),
-                    field: PRIMARY_KEY_COLUMN.to_owned(),
+                    field: Word::from(PRIMARY_KEY_COLUMN),
                     field_type: q::Type::NonNullType(Box::new(q::Type::NamedType(
                         "String".to_owned(),
                     ))),
@@ -927,7 +783,6 @@ impl Layout {
             let removed = RevertRemoveQuery::new(table, block)
                 .get_results(conn)?
                 .into_iter()
-                .map(|data| data.id)
                 .collect::<HashSet<_>>();
             // Make the versions current that existed at `block - 1` but that
             // are not current yet. Those are the ones that were updated or
@@ -938,7 +793,6 @@ impl Layout {
                 RevertClampQuery::new(table, block - 1)?
                     .get_results(conn)?
                     .into_iter()
-                    .map(|data| data.id)
                     .collect::<HashSet<_>>()
             };
             // Adjust the entity count; we can tell which operation was
@@ -978,7 +832,7 @@ impl Layout {
         site: &Site,
         block: BlockNumber,
     ) -> Result<(), StoreError> {
-        crate::dynds::revert_to(conn, site, block)?;
+        crate::dynds::revert(conn, site, block)?;
         crate::deployment::revert_subgraph_errors(conn, &site.deployment, block)?;
 
         Ok(())
@@ -1073,6 +927,7 @@ impl From<IdType> for ColumnType {
         match id_type {
             IdType::Bytes => ColumnType::Bytes,
             IdType::String => ColumnType::String,
+            IdType::Int8 => ColumnType::Int8,
         }
     }
 }
@@ -1082,24 +937,23 @@ impl ColumnType {
         schema: &InputSchema,
         field_type: &q::Type,
         catalog: &Catalog,
-        enums: &EnumMap,
-        id_types: &IdTypeMap,
         is_existing_text_column: bool,
     ) -> Result<ColumnType, StoreError> {
-        let name = named_type(field_type);
+        let name = field_type.get_base_type();
 
         // See if its an object type defined in the schema
         if let Some(id_type) = schema
             .entity_type(name)
             .ok()
-            .and_then(|entity_type| id_types.get(&entity_type))
+            .and_then(|entity_type| Some(entity_type.id_type()))
+            .transpose()?
         {
-            return Ok((*id_type).into());
+            return Ok(id_type.into());
         }
 
         // Check if it's an enum, and if it is, return an appropriate
         // ColumnType::Enum
-        if let Some(values) = enums.get(name) {
+        if let Some(values) = schema.enum_values(name) {
             // We do things this convoluted way to make sure field_type gets
             // snakecased, but the `.` must stay a `.`
             let name = SqlName::qualified_name(&catalog.site.namespace, &SqlName::from(name));
@@ -1150,9 +1004,10 @@ impl ColumnType {
         match self {
             ColumnType::String => Ok(IdType::String),
             ColumnType::Bytes => Ok(IdType::Bytes),
+            ColumnType::Int8 => Ok(IdType::Int8),
             _ => Err(diesel::result::Error::QueryBuilderError(
                 anyhow!(
-                    "only String and Bytes are allowed as primary keys but not {:?}",
+                    "only String, Bytes, and Int8 are allowed as primary keys but not {:?}",
                     self
                 )
                 .into(),
@@ -1164,7 +1019,7 @@ impl ColumnType {
 #[derive(Clone, Debug)]
 pub struct Column {
     pub name: SqlName,
-    pub field: String,
+    pub field: Word,
     pub field_type: q::Type,
     pub column_type: ColumnType,
     pub fulltext_fields: Option<HashSet<String>>,
@@ -1178,16 +1033,14 @@ impl Column {
     fn new(
         schema: &InputSchema,
         table_name: &SqlName,
-        field: &s::Field,
+        field: &Field,
         catalog: &Catalog,
-        enums: &EnumMap,
-        id_types: &IdTypeMap,
     ) -> Result<Column, StoreError> {
         SqlName::check_valid_identifier(&field.name, "attribute")?;
 
         let sql_name = SqlName::from(&*field.name);
-        let is_reference =
-            sql_name.as_str() != PRIMARY_KEY_COLUMN && is_object_type(&field.field_type, enums);
+
+        let is_reference = schema.is_reference(&field.field_type.get_base_type());
 
         let column_type = if sql_name.as_str() == PRIMARY_KEY_COLUMN {
             IdType::try_from(&field.field_type)?.into()
@@ -1197,8 +1050,6 @@ impl Column {
                 schema,
                 &field.field_type,
                 catalog,
-                enums,
-                id_types,
                 is_existing_text_column,
             )?
         };
@@ -1238,7 +1089,7 @@ impl Column {
 
         Ok(Column {
             name: sql_name,
-            field: def.name.to_string(),
+            field: Word::from(def.name.to_string()),
             field_type: q::Type::NamedType("fulltext".to_string()),
             column_type: ColumnType::TSVector(def.config.clone()),
             fulltext_fields: Some(def.included_fields.clone()),
@@ -1270,7 +1121,7 @@ impl Column {
     }
 
     pub fn is_fulltext(&self) -> bool {
-        named_type(&self.field_type) == "fulltext"
+        self.field_type.get_base_type() == "fulltext"
     }
 
     pub fn is_reference(&self) -> bool {
@@ -1353,29 +1204,31 @@ pub struct Table {
 impl Table {
     fn new(
         schema: &InputSchema,
-        defn: &s::ObjectType,
+        defn: &EntityType,
         catalog: &Catalog,
         fulltexts: Vec<FulltextDefinition>,
-        enums: &EnumMap,
-        id_types: &IdTypeMap,
         position: u32,
         has_causality_region: bool,
     ) -> Result<Table, StoreError> {
-        SqlName::check_valid_identifier(&defn.name, "object")?;
+        SqlName::check_valid_identifier(defn.as_str(), "object")?;
 
-        let table_name = SqlName::from(&*defn.name);
-        let columns = defn
+        let object_type = defn.object_type().ok_or_else(|| {
+            constraint_violation!("The type `{}` is not an object type", defn.as_str())
+        })?;
+
+        let table_name = SqlName::from(defn.as_str());
+        let columns = object_type
             .fields
-            .iter()
-            .filter(|field| !field.is_derived())
-            .map(|field| Column::new(schema, &table_name, field, catalog, enums, id_types))
+            .into_iter()
+            .filter(|field| !field.is_derived)
+            .map(|field| Column::new(schema, &table_name, field, catalog))
             .chain(fulltexts.iter().map(Column::new_fulltext))
             .collect::<Result<Vec<Column>, StoreError>>()?;
         let qualified_name = SqlName::qualified_name(&catalog.site.namespace, &table_name);
         let immutable = defn.is_immutable();
 
         let table = Table {
-            object: schema.entity_type(defn)?,
+            object: defn.cheap_clone(),
             name: table_name,
             qualified_name,
             // Default `is_account_like` to `false`; the caller should call
@@ -1469,22 +1322,6 @@ impl Table {
             &crate::block_range::BLOCK_RANGE_COLUMN_SQL
         }
     }
-}
-
-/// Return the enclosed named type for a field type, i.e., the type after
-/// stripping List and NonNull.
-fn named_type(field_type: &q::Type) -> &str {
-    match field_type {
-        q::Type::NamedType(name) => name.as_str(),
-        q::Type::ListType(child) => named_type(child),
-        q::Type::NonNullType(child) => named_type(child),
-    }
-}
-
-fn is_object_type(field_type: &q::Type, enums: &EnumMap) -> bool {
-    let name = named_type(field_type);
-
-    !enums.contains_key(name) && !ValueType::is_scalar(name)
 }
 
 #[derive(Clone)]

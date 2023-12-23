@@ -170,6 +170,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         graft: None,
         templates: vec![],
         chain: PhantomData,
+        indexer_hints: None,
     };
 
     // Create SubgraphDeploymentEntity
@@ -1117,6 +1118,7 @@ fn mock_data_source() -> graph_chain_ethereum::DataSource {
         network: Some(String::from("mainnet")),
         address: Some(Address::from_str("0123123123012312312301231231230123123123").unwrap()),
         start_block: 0,
+        end_block: None,
         mapping: Mapping {
             kind: String::from("ethereum/events"),
             api_version: Version::parse("0.1.0").unwrap(),
@@ -1260,6 +1262,7 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             graft: None,
             templates: vec![],
             chain: PhantomData,
+            indexer_hints: None,
         };
 
         let deployment =
@@ -1522,6 +1525,7 @@ fn handle_large_string_with_index() {
             deployment.hash.clone(),
             "test",
             metrics_registry.clone(),
+            "test_shard".to_string(),
         );
 
         let block = TEST_BLOCK_3_PTR.number;
@@ -1623,6 +1627,7 @@ fn handle_large_bytea_with_index() {
             deployment.hash.clone(),
             "test",
             metrics_registry.clone(),
+            "test_shard".to_string(),
         );
 
         let block = TEST_BLOCK_3_PTR.number;
@@ -1941,7 +1946,8 @@ fn cleanup_cached_blocks() {
         block_store::set_chain(
             vec![&*GENESIS_BLOCK, &*BLOCK_ONE, &*BLOCK_TWO, &*BLOCK_THREE],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
@@ -1972,7 +1978,8 @@ fn parse_timestamp() {
                 &*BLOCK_THREE_TIMESTAMP,
             ],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
@@ -2005,7 +2012,8 @@ fn parse_timestamp_firehose() {
                 &*BLOCK_THREE_TIMESTAMP_FIREHOSE,
             ],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)
@@ -2038,7 +2046,8 @@ fn parse_null_timestamp() {
                 &*BLOCK_THREE_NO_TIMESTAMP,
             ],
             NETWORK_NAME,
-        );
+        )
+        .await;
         let chain_store = store
             .block_store()
             .chain_store(NETWORK_NAME)

@@ -32,7 +32,7 @@ use graph_store_postgres::{
 };
 use lazy_static::lazy_static;
 use std::collections::BTreeMap;
-use std::{collections::HashMap, env, num::ParseIntError, sync::Arc, time::Duration};
+use std::{collections::HashMap, num::ParseIntError, sync::Arc, time::Duration};
 const VERSION_LABEL_KEY: &str = "version";
 
 git_testament!(TESTAMENT);
@@ -343,6 +343,20 @@ pub enum Command {
         /// Skip confirmation prompt
         #[clap(long, short)]
         force: bool,
+    },
+
+    // Deploy a subgraph
+    Deploy {
+        name: DeploymentSearch,
+        deployment: DeploymentSearch,
+
+        /// The url of the graph-node
+        #[clap(long, short, default_value = "http://localhost:8020")]
+        url: String,
+
+        /// Create the subgraph name if it does not exist
+        #[clap(long, short)]
+        create: bool,
     },
 }
 
@@ -1512,6 +1526,18 @@ async fn main() -> anyhow::Result<()> {
                 force,
             )
             .await
+        }
+
+        Deploy {
+            deployment,
+            name,
+            url,
+            create,
+        } => {
+            let store = ctx.store();
+            let subgraph_store = store.subgraph_store();
+
+            commands::deploy::run(subgraph_store, deployment, name, url, create).await
         }
     }
 }

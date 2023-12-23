@@ -51,6 +51,7 @@ pub use petgraph;
 pub use prometheus;
 pub use semver;
 pub use slog;
+pub use stable_hash;
 pub use stable_hash_legacy;
 pub use tokio;
 pub use tokio_retry;
@@ -70,6 +71,7 @@ pub mod prelude {
     pub use async_trait::async_trait;
     pub use bigdecimal;
     pub use chrono;
+    pub use diesel;
     pub use envconfig;
     pub use ethabi;
     pub use futures::future;

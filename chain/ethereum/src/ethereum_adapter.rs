@@ -45,6 +45,7 @@ use std::time::Instant;
 
 use crate::adapter::ProviderStatus;
 use crate::chain::BlockFinality;
+use crate::trigger::LogRef;
 use crate::Chain;
 use crate::NodeCapabilities;
 use crate::{
@@ -490,6 +491,7 @@ impl EthereumAdapter {
                         "stack limit reached 1024",
                         // See f0af4ab0-6b7c-4b68-9141-5b79346a5f61 for why the gas limit is considered deterministic.
                         "out of gas",
+                        "stack underflow",
                     ];
 
                     let env_geth_call_errors = ENV_VARS.geth_eth_call_errors.iter();
@@ -1336,7 +1338,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
     }
 
     /// Load Ethereum blocks in bulk, returning results as they come back as a Stream.
-    fn load_blocks(
+    async fn load_blocks(
         &self,
         logger: Logger,
         chain_store: Arc<dyn ChainStore>,
@@ -1345,7 +1347,9 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let block_hashes: Vec<_> = block_hashes.iter().cloned().collect();
         // Search for the block in the store first then use json-rpc as a backup.
         let mut blocks: Vec<Arc<LightEthereumBlock>> = chain_store
-            .blocks(&block_hashes.iter().map(|&b| b.into()).collect::<Vec<_>>())
+            .cheap_clone()
+            .blocks(block_hashes.iter().map(|&b| b.into()).collect::<Vec<_>>())
+            .await
             .map_err(|e| error!(&logger, "Error accessing block cache {}", e))
             .unwrap_or_default()
             .into_iter()
@@ -1527,6 +1531,7 @@ pub(crate) async fn blocks_with_triggers(
 
     let blocks = eth
         .load_blocks(logger.cheap_clone(), chain_store.clone(), block_hashes)
+        .await
         .and_then(
             move |block| match triggers_by_block.remove(&(block.number() as BlockNumber)) {
                 Some(triggers) => Ok(BlockWithTriggers::new(
@@ -1630,13 +1635,9 @@ pub(crate) fn parse_log_triggers(
         .transaction_receipts
         .iter()
         .flat_map(move |receipt| {
-            receipt
-                .logs
-                .iter()
-                .filter(move |log| log_filter.matches(log))
-                .map(move |log| {
-                    EthereumTrigger::Log(Arc::new(log.clone()), Some(receipt.cheap_clone()))
-                })
+            receipt.logs.iter().enumerate().map(move |(index, _)| {
+                EthereumTrigger::Log(LogRef::LogPosition(index, receipt.cheap_clone()))
+            })
         })
         .collect()
 }
@@ -2091,7 +2092,7 @@ async fn get_logs_and_transactions(
         let optional_receipt = log
             .transaction_hash
             .and_then(|txn| transaction_receipts_by_hash.get(&txn).cloned());
-        let value = EthereumTrigger::Log(Arc::new(log), optional_receipt);
+        let value = EthereumTrigger::Log(LogRef::FullLog(Arc::new(log), optional_receipt));
         log_triggers.push(value);
     }
 

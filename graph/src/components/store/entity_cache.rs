@@ -4,10 +4,9 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use crate::cheap_clone::CheapClone;
 use crate::components::store::write::EntityModification;
 use crate::components::store::{self as s, Entity, EntityOperation};
-use crate::data::store::{EntityValidationError, IntoEntityIterator};
+use crate::data::store::{EntityValidationError, Id, IdType, IntoEntityIterator};
 use crate::prelude::ENV_VARS;
 use crate::schema::{EntityKey, InputSchema};
 use crate::util::intern::Error as InternError;
@@ -69,6 +68,9 @@ impl EntityOp {
 ///   (1) no entity appears in more than one operation
 ///   (2) only entities that will actually be changed from what they
 ///       are in the store are changed
+///
+/// It is important for correctness that this struct is newly instantiated
+/// at every block using `with_current` to seed the cache.
 pub struct EntityCache {
     /// The state of entities in the store. An entry of `None`
     /// means that the entity is not present in the store
@@ -87,6 +89,13 @@ pub struct EntityCache {
     pub store: Arc<dyn s::ReadStore>,
 
     pub schema: InputSchema,
+
+    /// A sequence number for generating entity IDs. We use one number for
+    /// all id's as the id's are scoped by block and a u32 has plenty of
+    /// room for all changes in one block. To ensure reproducability of
+    /// generated IDs, the `EntityCache` needs to be newly instantiated for
+    /// each block
+    seq: u32,
 }
 
 impl Debug for EntityCache {
@@ -113,6 +122,7 @@ impl EntityCache {
             in_handler: false,
             schema: store.input_schema(),
             store,
+            seq: 0,
         }
     }
 
@@ -135,6 +145,7 @@ impl EntityCache {
             in_handler: false,
             schema: store.input_schema(),
             store,
+            seq: 0,
         }
     }
 
@@ -201,10 +212,10 @@ impl EntityCache {
         &mut self,
         eref: &LoadRelatedRequest,
     ) -> Result<Vec<Entity>, anyhow::Error> {
-        let (base_type, field) = self.schema.get_field_related(eref)?;
+        let (entity_type, field) = self.schema.get_field_related(eref)?;
 
         let query = DerivedEntityQuery {
-            entity_type: self.schema.entity_type(base_type)?,
+            entity_type,
             entity_field: field.name.clone().into(),
             value: eref.entity_id.clone(),
             causality_region: eref.causality_region,
@@ -325,7 +336,7 @@ impl EntityCache {
     /// returned.
     pub fn set(&mut self, key: EntityKey, entity: Entity) -> Result<(), anyhow::Error> {
         // check the validate for derived fields
-        let is_valid = entity.validate(&self.schema, &key).is_ok();
+        let is_valid = entity.validate(&key).is_ok();
 
         self.entity_op(key.clone(), EntityOp::Update(entity));
 
@@ -333,7 +344,6 @@ impl EntityCache {
         // lookup in the database and check again with an entity that merges
         // the existing entity with the changes
         if !is_valid {
-            let schema = self.schema.cheap_clone();
             let entity = self.get(&key, GetScope::Store)?.ok_or_else(|| {
                 anyhow!(
                     "Failed to read entity {}[{}] back from cache",
@@ -341,7 +351,7 @@ impl EntityCache {
                     key.entity_id
                 )
             })?;
-            entity.validate(&schema, &key)?;
+            entity.validate(&key)?;
         }
 
         Ok(())
@@ -384,6 +394,13 @@ impl EntityCache {
         for (key, op) in other.updates {
             self.entity_op(key, op);
         }
+    }
+
+    /// Generate an id.
+    pub fn generate_id(&mut self, id_type: IdType, block: BlockNumber) -> anyhow::Result<Id> {
+        let id = id_type.generate_id(block, self.seq)?;
+        self.seq += 1;
+        Ok(id)
     }
 
     /// Return the changes that have been made via `set` and `remove` as

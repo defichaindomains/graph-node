@@ -74,6 +74,9 @@ impl SubstreamsBlockIngestor {
 
         while let Some(message) = stream.next().await {
             let (block, cursor) = match message {
+                Ok(BlockStreamEvent::ProcessWasmBlock(_block_ptr, _data, _handler, _cursor)) => {
+                    unreachable!("Block ingestor should never receive raw blocks");
+                }
                 Ok(BlockStreamEvent::ProcessBlock(triggers, cursor)) => {
                     (Arc::new(triggers.block), cursor)
                 }
@@ -144,7 +147,7 @@ impl BlockIngestor for SubstreamsBlockIngestor {
                 mapper.cheap_clone(),
                 package.modules.clone(),
                 "map_blocks".to_string(),
-                vec![],
+                vec![-1],
                 vec![],
                 self.logger.cheap_clone(),
                 self.metrics.cheap_clone(),

@@ -8,7 +8,7 @@ mod tests;
 
 use crate::{
     blockchain::{
-        BlockPtr, Blockchain, DataSource as _, DataSourceTemplate as _, MappingTriggerTrait,
+        Block, BlockPtr, Blockchain, DataSource as _, DataSourceTemplate as _, MappingTriggerTrait,
         TriggerData as _, UnresolvedDataSource as _, UnresolvedDataSourceTemplate as _,
     },
     components::{
@@ -98,6 +98,14 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
+    pub fn is_onchain(&self) -> bool {
+        self.as_onchain().is_some()
+    }
+
+    pub fn is_offchain(&self) -> bool {
+        self.as_offchain().is_some()
+    }
+
     pub fn address(&self) -> Option<Vec<u8>> {
         match self {
             Self::Onchain(ds) => ds.address().map(ToOwned::to_owned),
@@ -123,6 +131,13 @@ impl<C: Blockchain> DataSource<C> {
         match self {
             Self::Onchain(ds) => ds.min_spec_version(),
             Self::Offchain(ds) => ds.min_spec_version(),
+        }
+    }
+
+    pub fn end_block(&self) -> Option<BlockNumber> {
+        match self {
+            Self::Onchain(ds) => ds.end_block(),
+            Self::Offchain(_) => None,
         }
     }
 
@@ -177,6 +192,7 @@ impl<C: Blockchain> DataSource<C> {
         logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<MappingTrigger<C>>>, Error> {
         match (self, trigger) {
+            (Self::Onchain(ds), _) if ds.has_expired(block.number()) => Ok(None),
             (Self::Onchain(ds), TriggerData::Onchain(trigger)) => ds
                 .match_and_decode(trigger, block, logger)
                 .map(|t| t.map(|t| t.map(MappingTrigger::Onchain))),
@@ -433,13 +449,6 @@ impl<C: Blockchain> TriggerData<C> {
         match self {
             Self::Onchain(trigger) => trigger.error_context(),
             Self::Offchain(trigger) => format!("{:?}", trigger.source),
-        }
-    }
-
-    pub fn address_match(&self) -> Option<Vec<u8>> {
-        match self {
-            Self::Onchain(trigger) => trigger.address_match().map(|address| address.to_owned()),
-            Self::Offchain(trigger) => trigger.source.address(),
         }
     }
 }
